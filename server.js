@@ -8,7 +8,6 @@ const UUID = (process.env.UUID || '').trim().toLowerCase();
 const UUID_HEX = UUID.replace(/-/g, '');
 let WSPATH = (process.env.WSPATH || '/9106f955f584').trim();
 if (!WSPATH.startsWith('/')) WSPATH = '/' + WSPATH;
-console.log('VLESS-WS server starting, port=' + PORT + ' path=' + WSPATH);
 function parseAddr(buf, off) {
   const type = buf[off];
   if (type === 1) {
@@ -30,6 +29,19 @@ function parseAddr(buf, off) {
   }
   return null;
 }
+function ipv6Bytes(host) {
+  const out = Buffer.alloc(16);
+  let groups = [];
+  if (host.indexOf('::') >= 0) {
+    const p = host.split('::');
+    const left = p[0] ? p[0].split(':') : [];
+    const right = p[1] ? p[1].split(':') : [];
+    const missing = 8 - left.length - right.length;
+    groups = left.concat(new Array(missing).fill('0'), right);
+  } else { groups = host.split(':'); }
+  groups.forEach((g, i) => { out.writeUInt16BE(parseInt(g || '0', 16), i * 2); });
+  return out;
+}
 function addrBuf(host, port) {
   if (net.isIPv4(host)) {
     const b = Buffer.alloc(1 + 4 + 2);
@@ -39,7 +51,9 @@ function addrBuf(host, port) {
     return b;
   }
   if (net.isIPv6(host)) {
-    return Buffer.concat([Buffer.from([3]), Buffer.from(host.split(':').flatMap(() => [])), Buffer.alloc(0)]);
+    const b = Buffer.alloc(1 + 16 + 2);
+    b[0] = 3; ipv6Bytes(host).copy(b, 1); b.writeUInt16BE(port, 17);
+    return b;
   }
   const hb = Buffer.from(host, 'utf8');
   const b = Buffer.alloc(1 + 1 + hb.length + 2);
@@ -47,20 +61,21 @@ function addrBuf(host, port) {
   return b;
 }
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/health') { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('OK\n'); return; }
-  res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not Found\n');
+  if (req.url === '/' || req.url === '/health') { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('OK'); return; }
+  res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not Found');
 });
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   let path = req.url || '';
   try { path = new URL(req.url, 'http://x').pathname; } catch (e) {}
-  if (path !== WSPATH) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
+  if (path !== WSPATH) { socket.destroy(); return; }
   wss.handleUpgrade(req, socket, head, (ws) => { wss.emit('connection', ws, req); });
 });
 wss.on('connection', (ws) => {
   let remote = null;
   let udpSocket = null;
   let udpDest = null;
+  let udpRespSent = false;
   let headerDone = false;
   let command = 0;
   let version = 0;
@@ -96,13 +111,14 @@ wss.on('connection', (ws) => {
         } else if (command === 2) {
           udpDest = { host, port };
           udpSocket = dgram.createSocket('udp4');
-          udpSocket.on('message', (msg, rinfo) => {
-            const dest = (rinfo && rinfo.address) ? { host: udpDest.host, port: udpDest.port } : udpDest;
-            const ab = addrBuf(dest.host, dest.port);
+          udpSocket.on('message', (msg) => {
+            const ab = addrBuf(udpDest.host, udpDest.port);
             const pkt = Buffer.alloc(2 + ab.length + msg.length);
             pkt.writeUInt16BE(ab.length + msg.length, 0);
             ab.copy(pkt, 2); msg.copy(pkt, 2 + ab.length);
-            if (ws.readyState === 1) ws.send(Buffer.concat([respHeader(), pkt]));
+            if (ws.readyState !== 1) return;
+            if (!udpRespSent) { udpRespSent = true; ws.send(Buffer.concat([respHeader(), pkt])); }
+            else { ws.send(pkt); }
           });
           udpSocket.on('error', () => {});
           if (payload.length) udpSocket.send(payload, port, host, () => {});
@@ -121,11 +137,11 @@ wss.on('connection', (ws) => {
         if (len <= 0 || off + 2 + len > buf.length) break;
         const pkt = buf.slice(off + 2, off + 2 + len);
         const addr = parseAddr(pkt, 0);
-        if (!addr || addr.next > pkt.length) break;
-        const data = pkt.slice(addr.next);
-        udpDest = { host: addr.host, port: pkt.readUInt16BE(addr.next - 2) };
-        // port is before addr? VLESS UDP packet: addr then data, port is in header? Use parsed: port is last 2 bytes before data is not standard; fallback to header port
-        udpSocket.send(data, udpDest.port || 53, addr.host, () => {});
+        if (!addr || addr.next + 2 > pkt.length) break;
+        const udpPort = pkt.readUInt16BE(addr.next);
+        const udpData = pkt.slice(addr.next + 2);
+        udpDest = { host: addr.host, port: udpPort };
+        udpSocket.send(udpData, udpPort, addr.host, () => {});
         handled = true;
         off += 2 + len;
       }
@@ -134,4 +150,4 @@ wss.on('connection', (ws) => {
     }
   });
 });
-server.listen(PORT, '0.0.0.0', () => { console.log('Listening on ' + PORT); });
+server.listen(PORT, '0.0.0.0', () => { console.log('Listening on ' + PORT + ' path ' + WSPATH); });
