@@ -1,0 +1,15 @@
+{
+  "name": "render-vless-node",
+  "version": "1.0.0",
+  "description": "VLESS over WebSocket Node service for Render",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
